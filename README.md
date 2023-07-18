@@ -3,7 +3,6 @@
 ## Requirements
 
 OpenCV
-
 ```pip install opencv-python```
 
 PyRealSense
