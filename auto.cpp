@@ -190,6 +190,194 @@ IF MotionSeqRegister <> 0 AND ServoReady THEN
     MotionGoingTo := MotionSeqRegister;
 END_IF;
 
+//======================================================================
+// AUTO SEQUENCE ROUTINE (Merged State Machine + Motion Execution)
+//======================================================================
+
+CASE Step OF
+
+    // ---------------------------------------------------------
+    0: // Idle / start at Labeler
+    // ---------------------------------------------------------
+        IF CycleStart AND AutoMode AND ServoReady THEN
+            // Command move to Labeler
+            fbMoveAbs(
+                Axis := AxisRef,
+                Execute := TRUE,
+                Position := PosLabeler,
+                Velocity := 100.0,
+                Acceleration := 300.0,
+                Deceleration := 300.0
+            );
+            TargetPosition := PosLabeler;
+            TargetName := 'Labeler';
+            Step := 10;
+        END_IF;
+
+    // ---------------------------------------------------------
+    10: // Wait at Labeler
+    // ---------------------------------------------------------
+        IF fbMoveAbs.Done THEN
+            MotionAtRegister := 1;
+            fbMoveAbs.Execute := FALSE; // reset execute
+            // Gripper must be open at idle
+            OpenGripperCmd := TRUE;
+            Step := 20;
+        END_IF;
+
+    // ---------------------------------------------------------
+    20: // Decide routing based on bottle status
+    // ---------------------------------------------------------
+        CASE BottleStatus OF
+            1: // Passed -> go to Cabinet 1 (example)
+                fbMoveAbs(
+                    Axis := AxisRef,
+                    Execute := TRUE,
+                    Position := PosCabinet[1],
+                    Velocity := 100.0,
+                    Acceleration := 300.0,
+                    Deceleration := 300.0
+                );
+                TargetPosition := PosCabinet[1];
+                TargetName := 'Cabinet 1';
+                Step := 30;
+
+            2, 3: // RejectEmptyBottle or RejectFullBottle -> Capper
+                fbMoveAbs(
+                    Axis := AxisRef,
+                    Execute := TRUE,
+                    Position := PosCapper,
+                    Velocity := 100.0,
+                    Acceleration := 300.0,
+                    Deceleration := 300.0
+                );
+                TargetPosition := PosCapper;
+                TargetName := 'Capper';
+                Step := 100;
+
+            ELSE
+                Step := 10; // wait until status available
+        END_CASE;
+
+    // ---------------------------------------------------------
+    30: // At Cabinet -> wait for fill complete
+    // ---------------------------------------------------------
+        IF fbMoveAbs.Done THEN
+            MotionAtRegister := 2;
+            fbMoveAbs.Execute := FALSE;
+
+            IF FillComplete THEN
+                fbMoveAbs(
+                    Axis := AxisRef,
+                    Execute := TRUE,
+                    Position := PosCamera,
+                    Velocity := 100.0,
+                    Acceleration := 300.0,
+                    Deceleration := 300.0
+                );
+                TargetPosition := PosCamera;
+                TargetName := 'Camera';
+                Step := 40;
+            END_IF;
+        END_IF;
+
+    // ---------------------------------------------------------
+    40: // At Camera -> wait PPS or timer
+    // ---------------------------------------------------------
+        IF fbMoveAbs.Done THEN
+            MotionAtRegister := 13;
+            fbMoveAbs.Execute := FALSE;
+
+            IF CameraTriggerOK THEN
+                Step := 50;
+            ELSE
+                tCamDelay(IN := TRUE, PT := T#500MS);
+                IF tCamDelay.Q THEN
+                    Step := 50;
+                END_IF;
+            END_IF;
+        END_IF;
+
+    // ---------------------------------------------------------
+    50: // Move to Capper
+    // ---------------------------------------------------------
+        fbMoveAbs(
+            Axis := AxisRef,
+            Execute := TRUE,
+            Position := PosCapper,
+            Velocity := 100.0,
+            Acceleration := 300.0,
+            Deceleration := 300.0
+        );
+        TargetPosition := PosCapper;
+        TargetName := 'Capper';
+        Step := 60;
+
+    // ---------------------------------------------------------
+    60: // Wait at Capper -> handoff complete
+    // ---------------------------------------------------------
+        IF fbMoveAbs.Done THEN
+            MotionAtRegister := 14;
+            fbMoveAbs.Execute := FALSE;
+
+            IF HandoffComplete THEN
+                OpenGripperCmd := TRUE; // release bottle
+                Step := 70;
+            END_IF;
+        END_IF;
+
+    // ---------------------------------------------------------
+    70: // Return to Labeler after capper
+    // ---------------------------------------------------------
+        IF OpenGripperComplete THEN
+            fbMoveAbs(
+                Axis := AxisRef,
+                Execute := TRUE,
+                Position := PosLabeler,
+                Velocity := 100.0,
+                Acceleration := 300.0,
+                Deceleration := 300.0
+            );
+            TargetPosition := PosLabeler;
+            TargetName := 'Labeler';
+            Step := 80;
+        END_IF;
+
+    80: // Confirm back at Labeler -> cycle reset
+        IF fbMoveAbs.Done THEN
+            MotionAtRegister := 1;
+            fbMoveAbs.Execute := FALSE;
+            Step := 0; // cycle complete
+        END_IF;
+
+    // ---------------------------------------------------------
+    100: // Direct Capper path (Reject cases)
+    // ---------------------------------------------------------
+        IF fbMoveAbs.Done THEN
+            MotionAtRegister := 14;
+            fbMoveAbs.Execute := FALSE;
+
+            IF HandoffComplete THEN
+                OpenGripperCmd := TRUE;
+                fbMoveAbs(
+                    Axis := AxisRef,
+                    Execute := TRUE,
+                    Position := PosLabeler,
+                    Velocity := 100.0,
+                    Acceleration := 300.0,
+                    Deceleration := 300.0
+                );
+                TargetPosition := PosLabeler;
+                TargetName := 'Labeler';
+                Step := 80;
+            END_IF;
+        END_IF;
+
+    ELSE
+        Step := 0;
+END_CASE;
+
+
 IF fbMoveAbs.Done THEN
     MotionAtRegister := MotionSeqRegister;
     MotionSeqRegister := 0;           // Clear command
