@@ -1,137 +1,110 @@
-(*
-Bottle SORTER – Auto + Manual
-- Uses existing CurrentGVL variables (no new globals).
-- Auto: picks a lane (simple rule: PASS -> round-robin lanes 1..6, REJECT -> lane 7),
-        indexes servo to lane, handshakes with Lift routine.
-- Manual: Home / index-to-lane / jog / open-close gate.
-*)
-
+PROGRAM PRG_BottleSorter
 VAR
-    // ===== Internal State / Helpers =====
-    iSorterStep         : INT := 0;           // state machine
-    iLaneCmd            : INT := 0;           // 0..7 commanded lane (3-bit)
-    iLaneCmdPrev        : INT := -1;          // detect command change
-    iNextGoodLane       : INT := 1;           // simple round-robin 1..6
-    bCmdBusy            : BOOL;               // start pulse stretching
-    tCmdPulse           : TON;                // CSTR/PWRT pulse
-    tInPosTmo           : TON;                // timeout reaching lane
-    tGatePulse          : TON;                // optional pulse for gate
-    bFaultSorter        : BOOL;               // local fault flag
-
-    // convenience aliases (readability)
-    bAuto    : BOOL := bOptifillMachineInAutoMode;      // B33[3].4
-    bManual  : BOOL := bOptifillMachineInManualMode;    // B33[3].2
+    iSorterStep     : INT := 0;
+    tCmdPulse       : TON;
+    tInPosTimeout   : TON;
+    tGateDelay      : TON;
+    iTargetLanePrev : INT := -1;
+    bSorterPermissive : BOOL;
 END_VAR
 
+// ---------------------
+// Safety permissive
+// ---------------------
+bSorterPermissive :=
+    bControlPowerAndAirOn AND
+    bSafetyOK AND
+    bSorterDoorClosed AND
+    bCapperDoorClosed AND
+    bSorterServoReady AND
+    NOT bSorterServoAlarm;
 
 // ---------------------
-// Manual controls (HMI)
+// Manual Controls
 // ---------------------
-IF bManual THEN
-    // Servo HOME
-    bHomeBottleSorter := bManualHomeSorter OR bSorterManualHomeServo;
+IF bOptifillMachineInManualMode THEN
+    // Manual home
+    bHomeBottleSorter := bManualHomeSorter;
 
-    // Manual lane index (N11[180].0..6 set one at a time)
-    IF    bManualIndexToLane1 THEN iLaneCmd := 1
-    ELSIF bManualIndexToLane2 THEN iLaneCmd := 2
-    ELSIF bManualIndexToLane3 THEN iLaneCmd := 3
-    ELSIF bManualIndexToLane4 THEN iLaneCmd := 4
-    ELSIF bManualIndexToLane5 THEN iLaneCmd := 5
-    ELSIF bManualIndexToLane6 THEN iLaneCmd := 6
-    ELSIF bManualIndexToLane7 THEN iLaneCmd := 7
+    // Lane select
+    IF    bManualIndexToLane1 THEN iTargetLane := 1;
+    ELSIF bManualIndexToLane2 THEN iTargetLane := 2;
+    ELSIF bManualIndexToLane3 THEN iTargetLane := 3;
+    ELSIF bManualIndexToLane4 THEN iTargetLane := 4;
+    ELSIF bManualIndexToLane5 THEN iTargetLane := 5;
+    ELSIF bManualIndexToLane6 THEN iTargetLane := 6;
+    ELSIF bManualIndexToLane7 THEN iTargetLane := 7;
     END_IF;
 
-    // Open/Close gate (manual jog style)
-    bOpenSorterGate  := bManualOpenSorterGate;
-    bCloseSorterGate := bManualCloseSorterGate;
-
-    // Manual jog (optional): set JISE=0 (index mode) for clean behavior when indexing
-    bSorterServoJISE := FALSE;
-    bSorterServoOperationMode := FALSE;         // Normal (0)
+    // Manual gate
+    bOpenSorterGateOutput  := bManualOpenSorterGate;
+    bCloseSorterGateOutput := bManualCloseSorterGate;
 END_IF;
 
+// ---------------------
+// Lane Command Encode
+// ---------------------
+bSorterServoPositionCmdBit1 := (iTargetLane AND 1) <> 0;
+bSorterServoPositionCmdBit2 := (iTargetLane AND 2) <> 0;
+bSorterServoPositionCmdBit3 := (iTargetLane AND 4) <> 0;
 
-// ---------------------------
-// Encode lane -> 3 command bits
-// ---------------------------
-bSorterServoPositionCmdBit1 := (iLaneCmd AND 1) <> 0;   // LSB
-bSorterServoPositionCmdBit2 := (iLaneCmd AND 2) <> 0;
-bSorterServoPositionCmdBit3 := (iLaneCmd AND 4) <> 0;
-
-// Pulse “Start / Position Write” (use existing helper bit)
-IF iLaneCmd <> iLaneCmdPrev THEN
-    // only when drive is OK & not moving & doors/safety closed
-    IF bSorterServoReady AND NOT bSorterServoAlarm AND NOT bSorterServoMoving
-       AND bSorterDoorClosed AND bCapperDoorClosed AND bControlPowerAndAirOn THEN
-        bSorterServoOperationMode := FALSE;     // Normal mode
-        bSorterServoJISE := FALSE;              // Jog-to-index (not inching)
-        bSorterServoPositionCmdPulse := TRUE;   // pulse start
-        tCmdPulse(IN := TRUE, PT := T#150ms);
-        bCmdBusy := TRUE;
-    END_IF
-END_IF;
-
-IF bCmdBusy THEN
-    IF tCmdPulse.Q THEN
-        bSorterServoPositionCmdPulse := FALSE;
-        tCmdPulse(IN := FALSE);
-        bCmdBusy := FALSE;
-    END_IF;
-END_IF;
-
-iLaneCmdPrev := iLaneCmd;
-
-
-// ------------------------
-// AUTO – lane select + move
-// ------------------------
-IF bAuto AND bAutoSequenceEnable THEN
-
+// ---------------------
+// AUTO MODE
+// ---------------------
+IF bOptifillMachineInAutoMode AND bAutoSequenceEnable THEN
     CASE iSorterStep OF
-
-        0:  // Idle – wait for bottle at lift and capper complete cue from capper logic
-            bFaultSorter := FALSE;
-            tInPosTmo(IN := FALSE);
-            // very light debounce/guard: only proceed if servo OK & safeties OK
-            IF bBottleAtLift AND bSorterServoReady AND NOT bSorterServoAlarm
-               AND bSorterDoorClosed AND bCapperDoorClosed AND bControlPowerAndAirOn THEN
-
-                // Pick lane:
-                //   - Reject (empty/full) -> lane 7
-                //   - Pass -> next good lane 1..6 (round-robin)
-                IF (iBottleStatus = 2) OR (iBottleStatus = 3) THEN
-                    iLaneCmd := 7;  // reject lane
-                ELSE
-                    iLaneCmd := iNextGoodLane;
-                    iNextGoodLane := iNextGoodLane + 1;
-                    IF iNextGoodLane > 6 THEN iNextGoodLane := 1 END_IF;
-                END_IF;
-
-                // Start timeout waiting for in-position
-                tInPosTmo(IN := TRUE, PT := T#6s);
+        0: // Idle → Issue move if lane changed
+            IF (iTargetLane <> iTargetLanePrev) AND bSorterPermissive AND NOT bSorterServoMoving THEN
+                bSorterServoOperationMode := FALSE;
+                bSorterServoJISE := FALSE;
+                bSorterServoCSTR_PWRT := TRUE;
+                tCmdPulse(IN := TRUE, PT := T#150ms);
+                tInPosTimeout(IN := TRUE, PT := T#10s);
                 iSorterStep := 10;
             END_IF;
 
-        10: // Wait sorter lane reach position (servo + prox)
-            // Both PLC position-ready and local lane sensor
+        10: // Wait in-position
+            bSorterServoCSTR_PWRT := FALSE;
             IF bSorterServoInPosition AND bBottleSorterLaneInPosition THEN
-                tInPosTmo(IN := FALSE);
+                tInPosTimeout(IN := FALSE);
+                iSorterCurrentLane := iTargetLane;
                 iSorterStep := 20;
-            ELSIF tInPosTmo.Q THEN
-                bFaultSorter := TRUE;           // could augment with HMI message
-                iSorterStep := 900;             // fault/end
+            ELSIF tInPosTimeout.Q THEN
+                iSorterStep := 900;
             END_IF;
 
-        20: // Lane is ready – hand off to Lift sequence
-            // Nothing else to do here: Lift PRG will raise/transfer/drop.
-            iSorterStep := 0;
+        20: // Open gate
+            IF bSorterPermissive THEN
+                bOpenSorterGateOutput  := TRUE;
+                bCloseSorterGateOutput := FALSE;
+                tGateDelay(IN := TRUE, PT := T#2000ms);
+                iSorterStep := 30;
+            END_IF;
 
-        900: // Fault: stop auto until reset
-            // Hold position; operator can jog manually
-            ; // no-op
+        30: // Close gate
+            IF bSorterGateOpen OR tGateDelay.Q THEN
+                bOpenSorterGateOutput  := FALSE;
+                bCloseSorterGateOutput := TRUE;
+                tGateDelay(IN := TRUE, PT := T#2000ms);
+                iSorterStep := 40;
+            END_IF;
 
-    END_CASE
-ELSE
-    // Auto disabled -> ensure timers off
-    tInPosTmo(IN := FALSE);
+        40: // Confirm closed
+            IF bSorterGateClosed THEN
+                bCloseSorterGateOutput := FALSE;
+                tGateDelay(IN := FALSE);
+                iSorterStep := 0;
+            ELSIF tGateDelay.Q THEN
+                iSorterStep := 900;
+            END_IF;
+
+        900: // Fault
+            bSorterServoCSTR_PWRT := FALSE;
+            bOpenSorterGateOutput := FALSE;
+            bCloseSorterGateOutput := FALSE;
+            tGateDelay(IN := FALSE);
+            tInPosTimeout(IN := FALSE);
+    END_CASE;
 END_IF;
+
+iTargetLanePrev := iTargetLane;
