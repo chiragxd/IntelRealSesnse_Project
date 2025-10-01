@@ -1,0 +1,53 @@
+PROGRAM PRG_Homing
+VAR
+    Axis        : AXIS_REF; // Link this to your AX5106 axis
+
+    fbPower     : MC_Power;
+    fbMoveVel   : MC_MoveVelocity;
+    fbStop      : MC_Stop;
+    fbSetPos    : MC_SetPosition;
+
+    bStartHoming : BOOL;   // Trigger from HMI
+    bSensor      : BOOL;   // Your digital input for home sensor
+    bHomed       : BOOL;
+
+    step : INT := 0;
+END_VAR
+
+
+CASE step OF
+    0: // Idle
+        bHomed := FALSE;
+        IF bStartHoming THEN
+            step := 10;
+        END_IF;
+
+    10: // Power axis
+        fbPower(Axis := Axis, Enable := TRUE);
+        IF fbPower.Status THEN
+            step := 20;
+        END_IF;
+
+    20: // Move right until sensor ON
+        fbMoveVel(Axis := Axis, Execute := TRUE, Velocity := 50.0, Direction := MC_Positive_Direction);
+        IF bSensor THEN
+            fbMoveVel(Execute := FALSE);
+            fbStop(Axis := Axis, Execute := TRUE, Deceleration := 100.0);
+            step := 30;
+        END_IF;
+
+    30: // Move left until sensor OFF
+        fbMoveVel(Axis := Axis, Execute := TRUE, Velocity := 50.0, Direction := MC_Negative_Direction);
+        IF NOT bSensor THEN
+            fbMoveVel(Execute := FALSE);
+            fbStop(Axis := Axis, Execute := TRUE, Deceleration := 100.0);
+            step := 40;
+        END_IF;
+
+    40: // Set home = 0.0
+        fbSetPos(Axis := Axis, Execute := TRUE, Position := 0.0);
+        IF fbSetPos.Done THEN
+            bHomed := TRUE;
+            step := 0;
+        END_IF;
+END_CASE
