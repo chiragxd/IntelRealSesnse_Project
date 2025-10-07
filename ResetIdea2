@@ -1,0 +1,116 @@
+(*
+=========================================================
+ MACHINE RESET & FLUSH HANDLING LOGIC  — FINAL VERSION
+=========================================================
+ PURPOSE:
+ - Detect PPS flush / batch change via New_Data_Arrival rising edge.
+ - If bottle currently in transfer gripper → mark as reject (status 3).
+ - Clear FIFO arrays (TODO + WIP) and halt all motions.
+ - Home all axes only when safe (no bottles on gripper or labeler).
+ - Manage Reset Enable / Complete flags and reset popup indication.
+=========================================================
+*)
+
+VAR
+    // Triggers
+    rTrig_NewFlush     : R_TRIG;
+    rTrig_ResetStart   : R_TRIG;
+
+    // Internal flags
+    bFlushTriggered    : BOOL;
+    bAllAxesHomed      : BOOL;
+    bResetInProgress   : BOOL;
+
+    // Popup / notification
+    bShowFlushPopup    : BOOL;
+END_VAR;
+
+
+// ======================================================
+// 1️⃣  FLUSH EVENT — triggered when PPS flushes the batch
+// ======================================================
+rTrig_NewFlush(CLK := New_Data_Arrival);
+
+IF rTrig_NewFlush.Q THEN
+    bFlushTriggered := TRUE;
+    bShowFlushPopup := TRUE;
+
+    // Reject bottle if one is currently being held
+    IF bBottleTransferGripperClosed OR bBottleAtLift OR bBottleLiftGripperClosed THEN
+        iBottleStatus := 3;             // reject that bottle
+    END_IF;
+
+    // Halt the machine and mark flush event
+    bCycleStart := FALSE;
+    bOptifillMachineInAutoMode := FALSE;
+
+    // Clear FIFO queues
+    iTODO_Head := 1;
+    iTODO_Tail := 0;
+    iWIP_Count := 0;
+    FOR i := 1 TO 100 DO
+        aTODO[i].OrderID := 0;
+        aTODO[i].Active := FALSE;
+    END_FOR;
+    FOR i := 1 TO 6 DO
+        aWIP[i].OrderID := 0;
+        aWIP[i].Active := FALSE;
+        aWIP[i].LaneAssigned := 0;
+        aWIP[i].BottleCount := 0;
+        _bLaneReadyToUnload[i] := FALSE;
+    END_FOR;
+END_IF;
+
+
+// ======================================================
+// 2️⃣  RESET SEQUENCE REQUEST — when operator presses Reset
+// ======================================================
+rTrig_ResetStart(CLK := bMachineResetEnable);
+
+IF rTrig_ResetStart.Q AND NOT bOptifillMachineInAutoMode THEN
+    bResetInProgress := TRUE;
+    bShowFlushPopup := FALSE;   // clear flush popup if visible
+    bResetComplete := FALSE;
+END_IF;
+
+
+// ======================================================
+// 3️⃣  RESET SEQUENCE — run only when safe
+// ======================================================
+IF bResetInProgress THEN
+    // Wait for all safe conditions
+    IF NOT bBottleTransferGripperClosed AND 
+       NOT bBottleAtLabeler AND 
+       NOT bBottleAtLift AND 
+       NOT bBottleLiftGripperClosed THEN
+
+        // Command all motion axes to home
+        bStartHomingTransfer := TRUE;
+        bStartHomingLift := TRUE;
+        bStartHomingEscapement := TRUE;
+        bStartHomingCapper := TRUE;
+
+        // Check when all confirm homed
+        IF bTransferHomed AND bLiftHomed AND bEscapementHomed AND bCapperHomed THEN
+            bAllAxesHomed := TRUE;
+        END_IF;
+
+        // Once all axes homed, mark reset complete
+        IF bAllAxesHomed THEN
+            bResetComplete := TRUE;
+            bMachineResetEnable := FALSE;
+            bResetInProgress := FALSE;
+            bAllAxesHomed := FALSE;
+        END_IF;
+    END_IF;
+END_IF;
+
+
+// ======================================================
+// 4️⃣  POPUP DISPLAY FLAG
+// ======================================================
+IF bShowFlushPopup THEN
+    sPopupMessage := 'New PPS Data Received - Batch Flushed. System Halted.';
+ELSE
+    sPopupMessage := '';
+END_IF;
