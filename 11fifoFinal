@@ -1,0 +1,99 @@
+(*
+=========================================================
+ FIFO MANAGER  —  FINAL VERSION
+=========================================================
+ PURPOSE:
+ - Maintain order flow between PPS, sorter, and tote lanes
+ - 6 active orders (WIP) at a time → each tied to 1 sorter lane
+ - All other orders stored in TODO queue (FIFO)
+ - Oldest order always promoted first when lane frees up
+=========================================================
+*)
+
+VAR
+    // ------------------- ORDER STRUCT -------------------
+    TYPE stOrder :
+    STRUCT
+        OrderID       : DINT;
+        Quantity      : USINT;
+        BottleStatus  : INT;         // 1 = PASS, else FAIL
+        LaneAssigned  : USINT;       // 0 = not yet assigned
+        BottleCount   : USINT;       // bottles filled so far
+        Active        : BOOL;        // TRUE = active in WIP
+    END_STRUCT;
+    END_TYPE
+
+    // ------------------- ARRAYS -------------------
+    aTODO  : ARRAY[1..100] OF stOrder;   // waiting orders
+    aWIP   : ARRAY[1..6] OF stOrder;     // active orders (lanes)
+
+    iTODO_Head   : INT := 1;             // first valid TODO index
+    iTODO_Tail   : INT := 0;             // last valid TODO index
+    iWIP_Count   : INT := 0;             // active order count
+END_VAR
+
+
+// =========================================================
+// 1️⃣  RECEIVE NEW ORDER FROM PPS (push to TODO FIFO)
+// =========================================================
+IF bNewOrderFromPPS THEN
+    IF iTODO_Tail < 100 THEN
+        iTODO_Tail := iTODO_Tail + 1;
+        aTODO[iTODO_Tail].OrderID      := iPPS_OrderID;
+        aTODO[iTODO_Tail].Quantity     := PPS_Quantity;
+        aTODO[iTODO_Tail].BottleStatus := 1;     // default pass
+        aTODO[iTODO_Tail].Active       := FALSE;
+        aTODO[iTODO_Tail].LaneAssigned := 0;
+        aTODO[iTODO_Tail].BottleCount  := 0;
+    END_IF;
+END_IF;
+
+
+// =========================================================
+// 2️⃣  PROMOTE ORDER FROM TODO → WIP WHEN A LANE IS FREE
+// =========================================================
+FOR lane := 1 TO 6 DO
+    IF (NOT aWIP[lane].Active) AND (iTODO_Tail >= iTODO_Head) THEN
+        // move first TODO entry to this lane
+        aWIP[lane] := aTODO[iTODO_Head];
+        aWIP[lane].Active := TRUE;
+        aWIP[lane].LaneAssigned := lane;
+        iWIP_Count := iWIP_Count + 1;
+
+        // shift TODO queue
+        iTODO_Head := iTODO_Head + 1;
+    END_IF;
+END_FOR;
+
+
+// =========================================================
+// 3️⃣  WHEN BOTTLE ARRIVES → UPDATE WIP ENTRY
+// =========================================================
+IF RisingEdge(bBottleTransferAtCapperCon) THEN
+    // find order for current bottle by lane assignment
+    lane := iTargetLane;
+    IF (lane >= 1) AND (lane <= 6) AND aWIP[lane].Active THEN
+        aWIP[lane].BottleCount := aWIP[lane].BottleCount + 1;
+
+        // mark as ready when full
+        IF aWIP[lane].BottleCount >= aWIP[lane].Quantity THEN
+            _bLaneReadyToUnload[lane] := TRUE;
+        END_IF;
+    END_IF;
+END_IF;
+
+
+// =========================================================
+// 4️⃣  WHEN LANE UNLOADS → MARK ORDER COMPLETE & FREE LANE
+// =========================================================
+FOR lane := 1 TO 6 DO
+    IF LaneJustCleared[lane] THEN   // e.g. gate closed + lane empty
+        aWIP[lane].Active := FALSE;
+        aWIP[lane].OrderID := 0;
+        aWIP[lane].Quantity := 0;
+        aWIP[lane].BottleCount := 0;
+        aWIP[lane].LaneAssigned := 0;
+        _bLaneReadyToUnload[lane] := FALSE;
+        iWIP_Count := iWIP_Count - 1;
+    END_IF;
+END_FOR;
