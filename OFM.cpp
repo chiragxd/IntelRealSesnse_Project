@@ -1,12 +1,3 @@
-(*
-======================================================================
-  PROGRAM : PRG_OFM
-  PURPOSE : OptiFill Manager Main Logic (converted from Ladder)
-  AUTHOR  : Chirag / ChatGPT
-  NOTE    : Uses inline logic (no local functions) — compiles cleanly
-======================================================================
-*)
-
 PROGRAM PRG_OFM
 VAR
     // ---- System & Status ----
@@ -33,7 +24,7 @@ VAR
 
     // ---- Internal working variables ----
     bInit                    : BOOL := TRUE;
-    i, k                     : INT;
+    i, k, Lane, BottleReq, RouteCode, SelectedSlot : INT;
 
     ActiveTotes              : ARRAY[1..6] OF INT := [0,0,0,0,0,0];
     ActiveCount              : INT := 0;
@@ -60,6 +51,12 @@ VAR
     // ---- Sorter Parameters ----
     SorterAssignedLanes, SorterRemainingLanes, SorterRemainingCapacity : INT := 0;
 
+    // ---- Sorter Lane Assignment (from _31_ReceivePatientOrder) ----
+    LaneTote        : ARRAY[1..6] OF INT;    // Tote ID assigned to each lane
+    LaneBottleCount : ARRAY[1..6] OF INT;    // Bottles assigned to each lane
+    LaneAssigned    : ARRAY[1..6] OF BOOL;   // TRUE if lane occupied
+    bPatientOrderInducted : BOOL := FALSE;
+
     // ---- Temporary flags ----
     bIsDuplicate : BOOL;
 END_VAR
@@ -71,9 +68,12 @@ END_VAR
 IF bInit THEN
     FOR i := 1 TO 6 DO
         ActiveTotes[i] := 0;
+        LaneTote[i] := 0;
+        LaneBottleCount[i] := 0;
+        LaneAssigned[i] := FALSE;
     END_FOR
-    ActiveCount := 0;
 
+    ActiveCount := 0;
     ManHead := 0; ManTail := 0; ManCount := 0;
     BtlHead := 0; BtlTail := 0; BtlCount := 0;
 
@@ -94,12 +94,12 @@ END_IF;
 
 
 // ====================================================================
-// 1) PATIENT ORDER / TOTE INFO   (rungs 4–18)
+// 1️⃣ RECEIVE PATIENT ORDER / TOTE INFO   (rungs 4–18 + _31_ReceivePatientOrder)
 // ====================================================================
 IF nSys_ToteInfo_NewDataArrival <> 1 THEN
     bIsDuplicate := FALSE;
 
-    // --- Check for duplicate ToteID ---
+    // --- Duplicate check ---
     FOR k := 1 TO 6 DO
         IF ActiveTotes[k] = nSys_ToteInfo_ToteID THEN
             bIsDuplicate := TRUE;
@@ -114,13 +114,12 @@ IF nSys_ToteInfo_NewDataArrival <> 1 THEN
         err_PatientLimitExceeded := TRUE;
 
     ELSE
-        // --- Sorter capacity check (6 lanes * 5 bottles each) ---
+        // --- Sorter capacity check ---
         SorterRemainingLanes := 6 - SorterAssignedLanes;
         SorterRemainingCapacity := SorterRemainingLanes * 5;
 
         IF nSys_ToteInfo_NumberOfBottles > SorterRemainingCapacity THEN
             err_SorterCapacityExceeded := TRUE;
-
         ELSE
             // --- Manual FIFO push ---
             IF ManCount < MANUAL_FIFO_SIZE THEN
@@ -129,7 +128,7 @@ IF nSys_ToteInfo_NewDataArrival <> 1 THEN
                 ManHead := (ManHead + 1) MOD MANUAL_FIFO_SIZE;
                 ManCount := ManCount + 1;
 
-                // Add Tote to active list
+                // Add tote to active list
                 FOR k := 1 TO 6 DO
                     IF ActiveTotes[k] = 0 THEN
                         ActiveTotes[k] := nSys_ToteInfo_ToteID;
@@ -137,6 +136,43 @@ IF nSys_ToteInfo_NewDataArrival <> 1 THEN
                         EXIT;
                     END_IF
                 END_FOR
+
+                // ==============================================
+                // >>> RECEIVE PATIENT ORDER LOGIC (Lane Assignment)
+                // ==============================================
+                SelectedSlot := 0;
+                FOR k := 1 TO 6 DO
+                    IF ActiveTotes[k] = nSys_ToteInfo_ToteID THEN
+                        SelectedSlot := k;
+                        EXIT;
+                    END_IF
+                END_FOR
+
+                IF SelectedSlot > 0 THEN
+                    BottleReq := nSys_ToteInfo_NumberOfBottles;
+                    RouteCode := nSys_ToteInfo_Route;
+
+                    // Assign sorter lanes (each holds 5 bottles)
+                    FOR Lane := 1 TO 6 DO
+                        IF (LaneAssigned[Lane] = FALSE) AND (BottleReq > 0) THEN
+                            LaneTote[Lane] := nSys_ToteInfo_ToteID;
+                            IF BottleReq <= 5 THEN
+                                LaneBottleCount[Lane] := BottleReq;
+                                BottleReq := 0;
+                            ELSE
+                                LaneBottleCount[Lane] := 5;
+                                BottleReq := BottleReq - 5;
+                            END_IF
+                            LaneAssigned[Lane] := TRUE;
+                        END_IF
+                    END_FOR
+
+                    // Mark induction complete
+                    IF BottleReq = 0 THEN
+                        bPatientOrderInducted := TRUE;
+                    END_IF
+                END_IF
+                // ==============================================
             ELSE
                 err_ManualPickFifoFull := TRUE;
             END_IF
@@ -149,7 +185,7 @@ END_IF;
 
 
 // ====================================================================
-// 2) BOTTLE ORDER / FILLBTL   (rungs 19–29)
+// 2️⃣ BOTTLE ORDER / FILLBTL   (rungs 19–29)
 // ====================================================================
 IF nSys_FillBtl_NewDataArrival <> 1 THEN
     IF (nSys_FillBtl_Cabinet < 1) OR (nSys_FillBtl_Cabinet > 5) THEN
@@ -162,7 +198,6 @@ IF nSys_FillBtl_NewDataArrival <> 1 THEN
             Btl_BC1_FIFO[BtlHead]     := nSys_FillBtl_Barcode1;
             Btl_BC2_FIFO[BtlHead]     := nSys_FillBtl_Barcode2;
             Btl_BC3_FIFO[BtlHead]     := nSys_FillBtl_Barcode3;
-
             BtlHead := (BtlHead + 1) MOD BTL_FIFO_SIZE;
             BtlCount := BtlCount + 1;
         END_IF
@@ -173,45 +208,50 @@ END_IF;
 
 
 // ====================================================================
-// 3) BOTTLE STATUS   (rungs 30–34)
+// 3️⃣ BOTTLE STATUS   (rungs 30–34)
 // ====================================================================
 IF nSys_BtlStat_NewDataArrival <> 1 THEN
     CASE nSys_BtlStat_Status OF
         0: ; // OK
-        1: ; // No-Read (could trigger diagnostic)
-        2: ; // Out-of-Sync (could trigger diagnostic)
+        1: ; // No-Read
+        2: ; // Out-of-Sync
         ELSE
-            ; // Unknown status
+            ; // Unknown
     END_CASE
-
     nSys_BtlStat_NewDataArrival := 6;
 END_IF;
 
 
 // ====================================================================
-// 4) TOTE EJECT   (rungs 35–39)
+// 4️⃣ TOTE EJECT   (rungs 35–39)
 // ====================================================================
 IF nSys_ToteEject_NewDataArrival <> 1 THEN
-    // Search and remove from ActiveTotes
     FOR k := 1 TO 6 DO
         IF ActiveTotes[k] = nSys_ToteEject_ToteID THEN
             ActiveTotes[k] := 0;
             IF ActiveCount > 0 THEN
                 ActiveCount := ActiveCount - 1;
             END_IF
+            // Also free any lanes linked to this tote
+            FOR Lane := 1 TO 6 DO
+                IF LaneTote[Lane] = nSys_ToteEject_ToteID THEN
+                    LaneTote[Lane] := 0;
+                    LaneBottleCount[Lane] := 0;
+                    LaneAssigned[Lane] := FALSE;
+                END_IF
+            END_FOR
             EXIT;
         END_IF
     END_FOR
-
     nSys_ToteEject_NewDataArrival := 6;
 END_IF;
 
 
 // ====================================================================
-// 5) DIAGNOSTICS / ERROR MESSAGES  (rungs 51–62)
+// 5️⃣ DIAGNOSTICS / ERROR MESSAGES  (rungs 51–62)
 // ====================================================================
 
-// -- Patient Limit Exceeded --
+// Patient Limit Exceeded
 IF err_PatientLimitExceeded THEN
     nSys_Diag_LineID := 1;
     nSys_Diag_MessageID := 100;
@@ -220,7 +260,7 @@ IF err_PatientLimitExceeded THEN
     err_PatientLimitExceeded := FALSE;
 END_IF;
 
-// -- Duplicate Patient Order --
+// Duplicate Patient Order
 IF err_DuplicatePatientOrder THEN
     nSys_Diag_LineID := 1;
     nSys_Diag_MessageID := 101;
@@ -229,7 +269,7 @@ IF err_DuplicatePatientOrder THEN
     err_DuplicatePatientOrder := FALSE;
 END_IF;
 
-// -- Sorter Capacity Exceeded --
+// Sorter Capacity Exceeded
 IF err_SorterCapacityExceeded THEN
     nSys_Diag_LineID := 1;
     nSys_Diag_MessageID := 102;
@@ -238,7 +278,7 @@ IF err_SorterCapacityExceeded THEN
     err_SorterCapacityExceeded := FALSE;
 END_IF;
 
-// -- Invalid Filler Cabinet --
+// Invalid Filler Cabinet
 IF err_InvalidFillerCabinet THEN
     nSys_Diag_LineID := 1;
     nSys_Diag_MessageID := 200;
@@ -247,7 +287,7 @@ IF err_InvalidFillerCabinet THEN
     err_InvalidFillerCabinet := FALSE;
 END_IF;
 
-// -- Manual Pick FIFO Full --
+// Manual Pick FIFO Full
 IF err_ManualPickFifoFull THEN
     nSys_Diag_LineID := 1;
     nSys_Diag_MessageID := 104;
