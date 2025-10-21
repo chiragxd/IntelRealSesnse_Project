@@ -1,38 +1,30 @@
-🧩 Step 1: Define the Data Type (ST_Order)
-
-Create this under DUTs → ST_Order.TcDUT or inside a global declaration.
-
+🧩 1. Data Type Definition
 TYPE ST_Order :
 STRUCT
-    OrderID     : DINT;      // Unique ID of the order
-    CustomerID  : DINT;      // Example field from PPS
-    Priority    : INT;       // Can be used for scheduling (optional)
-    Quantity    : DINT;      // Number of items
-    Valid       : BOOL;      // TRUE when this order is valid
+    OrderID     : DINT;
+    CustomerID  : DINT;
+    Priority    : INT;
+    Quantity    : DINT;
+    Valid       : BOOL;
 END_STRUCT
 END_TYPE
-
-🗂 Step 2: Declare Global Variables (GVL_FIFO)
-
-Create a Global Variable List (GVL_FIFO.TcGVL)
-
+🗂 2. Global Variables (GVL_FIFO)
 VAR_GLOBAL
-    nSys_ToteInfo_NewDataArrival : BOOL;   // Signal from PPS/Kepware
-    PPSOrder : ST_Order;                   // Current incoming PPS order
+    nSys_ToteInfo_NewDataArrival : BOOL;   // PPS new order signal
+    PPSOrder : ST_Order;                   // Incoming order from PPS
 
-    MaxTODO : INT := 10;                   // Maximum number of TODO orders
-    MaxWIP  : INT := 4;                    // Maximum number of WIP slots
+    MaxTODO : INT := 10;
+    MaxWIP  : INT := 4;
 
-    aTODO : ARRAY [0..9] OF ST_Order;      // All orders waiting to be processed
-    aWIP  : ARRAY [0..3] OF ST_Order;      // Orders currently in progress
+    aTODO : ARRAY [0..9] OF ST_Order;      // All waiting orders
+    aWIP  : ARRAY [0..3] OF ST_Order;      // Active WIP orders
 
-    bMoveOrders : BOOL := TRUE;            // Control flag to enable TODO→WIP transfer
+    ActiveWIP_OrderID : DINT := 0;
+    ActiveWIP_Index   : INT := -1;
+
+    DummyCompletedID : DINT := 0;          // For testing completion
 END_VAR
-
-⚙️ Step 3: Function Block — FB_AddToTODO
-
-This block will take a new PPS order and push it into the first empty slot in aTODO.
-
+⚙️ 3. Add to TODO (FB_AddToTODO)
 FUNCTION_BLOCK FB_AddToTODO
 VAR_INPUT
     NewOrder : ST_Order;
@@ -48,11 +40,7 @@ FOR i := 0 TO MaxTODO - 1 DO
         EXIT;
     END_IF
 END_FOR
-
-⚙️ Step 4: Function Block — FB_MoveToWIP
-
-Moves orders FIFO-style from TODO → WIP when slots are free.
-
+⚙️ 4. Move from TODO → WIP (FB_MoveToWIP)
 FUNCTION_BLOCK FB_MoveToWIP
 VAR
     i, j : INT;
@@ -70,77 +58,104 @@ FOR i := 0 TO MaxWIP - 1 DO
         END_FOR
     END_IF
 END_FOR
-
-⚙️ Step 5: Function Block — FB_CompleteOrder
-
-Marks a WIP order as done and clears its slot.
-
+⚙️ 5. Complete Order + Shift FIFO (FB_CompleteOrder)
 FUNCTION_BLOCK FB_CompleteOrder
 VAR_INPUT
-    CompletedID : DINT; // The order ID that is now completed
+    CompletedID : DINT; // ID of completed order
 END_VAR
 VAR
-    i : INT;
+    i, j : INT;
+    FoundIndex : INT := -1;
 END_VAR
 
+// Find completed order
 FOR i := 0 TO MaxWIP - 1 DO
     IF aWIP[i].Valid AND (aWIP[i].OrderID = CompletedID) THEN
-        aWIP[i].Valid := FALSE; // remove from WIP
+        aWIP[i].Valid := FALSE;
+        FoundIndex := i;
         EXIT;
     END_IF
 END_FOR
 
-🧠 Step 6: Main Program Logic (PRG_FIFO_Manager)
+// Shift all remaining orders up (FIFO)
+IF FoundIndex >= 0 THEN
+    FOR j := FoundIndex TO MaxWIP - 2 DO
+        aWIP[j] := aWIP[j + 1];
+    END_FOR
+    aWIP[MaxWIP - 1].Valid := FALSE;
+END_IF
+⚙️ 6. Helper — Get Active WIP (Optional)
+FUNCTION_BLOCK FB_GetActiveWIP
+VAR_OUTPUT
+    ActiveCount : INT;
+    ActiveOrders : ARRAY [0..MaxWIP-1] OF ST_Order;
+END_VAR
+VAR
+    i, index : INT;
+END_VAR
 
-This program glues it all together.
+index := 0;
+ActiveCount := 0;
 
+FOR i := 0 TO MaxWIP - 1 DO
+    IF aWIP[i].Valid THEN
+        ActiveOrders[index] := aWIP[i];
+        index := index + 1;
+        ActiveCount := ActiveCount + 1;
+    END_IF
+END_FOR
+🧠 7. Main Program (PRG_FIFO_Manager)
 PROGRAM PRG_FIFO_Manager
 VAR
     fbAddToTODO     : FB_AddToTODO;
     fbMoveToWIP     : FB_MoveToWIP;
     fbCompleteOrder : FB_CompleteOrder;
-
-    DummyCompletedID : DINT; // for testing
+    fbGetActiveWIP  : FB_GetActiveWIP;
+    i : INT;
 END_VAR
 
-// Step 1: Detect new order from PPS
+// Step 1: Detect new PPS order
 IF nSys_ToteInfo_NewDataArrival THEN
     fbAddToTODO(NewOrder := PPSOrder);
-    nSys_ToteInfo_NewDataArrival := FALSE; // Reset trigger
+    nSys_ToteInfo_NewDataArrival := FALSE;
 END_IF
 
-// Step 2: Move orders from TODO → WIP if possible
-IF bMoveOrders THEN
-    fbMoveToWIP();
-END_IF
+// Step 2: Move TODO → WIP if space available
+fbMoveToWIP();
 
-// Step 3: Complete an order (simulate by ID)
+// Step 3: Complete an order if ID provided
 IF DummyCompletedID <> 0 THEN
     fbCompleteOrder(CompletedID := DummyCompletedID);
-    DummyCompletedID := 0; // reset
+    fbMoveToWIP(); // refill empty WIP slot
+    DummyCompletedID := 0;
 END_IF
 
-🧾 Step 7: Example Behavior Summary
-Stage	Action	Effect
-PPS sends NewDataArrival = 1	Adds order to aTODO	Stored in first empty slot
-bMoveOrders = TRUE	Moves order to WIP	Transfers FIFO-style
-When DummyCompletedID is set	Marks order complete	Clears WIP slot
-Empty WIP slots auto-filled	From TODO list	FIFO maintained
-🧪 Step 8: (Optional) FIFO Visualization
+// Step 4: Update active WIP order (first valid one)
+ActiveWIP_OrderID := 0;
+ActiveWIP_Index := -1;
 
-You can add a visualization table in TwinCAT HMI or Codesys Visu:
-
-Show all aTODO[i].OrderID and Valid status.
-
-Show all aWIP[i].OrderID and Valid status.
-
-Add buttons to simulate:
-
-New Order
-
-Move Orders
-
-Complete Order
-
-Would you like me to add automatic refill logic, so that as soon as an order is completed in WIP, the next TODO order automatically fills it (no need to call FB_MoveToWIP separately)?
-That would make it self-managed FIFO behavior — ideal for runtime automation.
+FOR i := 0 TO MaxWIP - 1 DO
+    IF aWIP[i].Valid THEN
+        ActiveWIP_OrderID := aWIP[i].OrderID;
+        ActiveWIP_Index := i;
+        EXIT;
+    END_IF
+END_FOR
+🧾 8. Example Runtime Behavior
+PPS adds orders:
+Step	Action	aTODO	aWIP
+1	NewDataArrival = TRUE	Order #101	—
+2	MoveToWIP	—	101
+3	NewDataArrival = TRUE	Order #102	101
+4	CompleteOrder(101)	102	(101 removed, 102 shifts up)
+✅ FIFO maintained
+✅ Always fills empty WIP slot from TODO
+✅ Easy to visualize on HMI
+🧰 Optional Visualization Tags
+You can display or monitor these on your HMI:
+aTODO[i].OrderID, aTODO[i].Valid
+aWIP[i].OrderID, aWIP[i].Valid
+ActiveWIP_OrderID
+ActiveWIP_Index
+Would you like me to make one compact version (single FB_FIFO_Manager) that wraps all of these blocks into one function block (handles add, move, complete, shift automatically with methods like .Add(), .Complete(), .GetActive())?
+That would make your logic even cleaner and production-ready.
