@@ -1,9 +1,10 @@
 //===========================================================
-// ORDER FIFO → WIP HANDLER  (TwinCAT ST)
+// ORDER FIFO → WIP HANDLER (FINAL VERSION)
+// Compatible with TwinCAT 3.1+ FB_MemRingBuffer
 //===========================================================
 
 VAR
-    // --- FIFO management ---
+    // FIFO
     fbTODOOrdersFifo : FB_MemRingBuffer;
     arrTODOBuffer    : ARRAY[0..SIZEOF(ST_Order) * 1000] OF BYTE;
     stNewOrder       : ST_Order;
@@ -12,20 +13,20 @@ VAR
     bOk              : BOOL;
     bInit            : BOOL := TRUE;
 
-    // --- Active WIP Orders (one per lane) ---
+    // WIP
     aWIPOrders : ARRAY[1..6] OF ST_Order;
     iLane      : INT;
 
-    // --- Status for HMI / debug ---
-    TotalTODOCount    : UDINT;
-    TotalActiveWIP    : INT;
-    TotalFreeLanes    : INT;
-    LaneStatusText    : ARRAY[1..6] OF STRING(40);
-END_VAR
+    // HMI / status
+    TotalTODOCount : UDINT;
+    TotalActiveWIP : INT;
+    TotalFreeLanes : INT;
+    LaneStatusText : ARRAY[1..6] OF STRING(40);
+END_VAR;
 
 
 //===========================================================
-// 1️⃣ INITIALIZATION (run once after startup)
+// 1️⃣ INITIALIZATION
 //===========================================================
 IF bInit THEN
     fbTODOOrdersFifo(
@@ -38,7 +39,7 @@ END_IF;
 
 
 //===========================================================
-// 2️⃣ ADD NEW ORDER FROM PPS INTO FIFO
+// 2️⃣ ADD NEW ORDER FROM PPS → FIFO
 //===========================================================
 IF nSys_ToteInfo_NewDataArrival = 1 THEN
     stNewOrder.ToteID          := nSys.ToteInfo.ToteID;
@@ -47,11 +48,10 @@ IF nSys_ToteInfo_NewDataArrival = 1 THEN
     stNewOrder.LaneAssigned    := 0;
     stNewOrder.Active          := FALSE;
 
-    // Correct pointer + size call
     fbTODOOrdersFifo.A_AddTail(
-        pSrc := ADR(stNewOrder),
-        cbSrc := SIZEOF(stNewOrder),
-        bOk  => bOk
+        pWrite  := ADR(stNewOrder),
+        cbWrite := SIZEOF(stNewOrder),
+        bOk     => bOk
     );
 
     nSys_ToteInfo_NewDataArrival := 6;
@@ -65,9 +65,9 @@ IF (bOptifillMachineInAutoMode AND bCycleStart AND NOT bOptiFillMachineInManualM
     FOR iLane := 1 TO 6 DO
         IF NOT aWIPOrders[iLane].Active THEN
             fbTODOOrdersFifo.A_RemoveHead(
-                pDst := ADR(stNextOrder),
-                cbDst := SIZEOF(stNextOrder),
-                bOk  => bOk
+                pRead  := ADR(stNextOrder),
+                cbRead := SIZEOF(stNextOrder),
+                bOk    => bOk
             );
 
             IF bOk THEN
@@ -102,20 +102,20 @@ END_FOR;
 
 
 //===========================================================
-// 5️⃣ STATUS MONITORING / HMI FEEDBACK
+// 5️⃣ STATUS / HMI FEEDBACK
 //===========================================================
 
-// FIFO count
+// FIFO stats
 TotalTODOCount := fbTODOOrdersFifo.nLoad;
 
 // Peek at next order (no remove)
 fbTODOOrdersFifo.A_GetHead(
-    pDst := ADR(NextOrderPreview),
-    cbDst := SIZEOF(NextOrderPreview),
-    bOk  => bOk
+    pRead  := ADR(NextOrderPreview),
+    cbRead := SIZEOF(NextOrderPreview),
+    bOk    => bOk
 );
 
-// WIP status summary
+// WIP overview
 TotalActiveWIP := 0;
 TotalFreeLanes := 0;
 
